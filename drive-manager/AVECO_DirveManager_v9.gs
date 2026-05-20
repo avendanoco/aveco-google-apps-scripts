@@ -1,5 +1,5 @@
 /** ============================================================
- *  AVECO Drive Manager v8.1
+ *  AVECO Drive Manager v8.2
  *  Gestión de Google Drive desde Google Sheets
  *  - Índice Drive v8   (columnas A-R)
  *  - Árbol de Carpetas v8  (columnas A-N)
@@ -8,6 +8,7 @@
  *  - Tags / Descripción con columna Dato + columna Nuevo
  *  - Mover por Est. separado de Renombrar
  *  - Después de mover: refresca Árbol / Índice automáticamente
+ *  - Índice con formato condicional por Lvl (P)
  * ============================================================
  */
 
@@ -95,7 +96,7 @@ function extraerPrefijo_(nombre) {
   if (!nombre || typeof nombre !== 'string') return '';
   const t = nombre.trim();
   if (!t) return '';
-  return t.split(' ' )[0].toUpperCase();
+  return t.split(' ')[0].toUpperCase();
 }
 
 function getExtension_(filename, mimeType) {
@@ -134,7 +135,7 @@ function prepararLogSheet_() {
   let sheet = ss.getSheetByName(LOG_SHEET);
   if (!sheet) sheet = ss.insertSheet(LOG_SHEET);
   sheet.clearContents();
-  const hdr = ['Timestamp', 'Tipo', 'Elemento', 'Acción', 'Detalle', 'Estado'];
+  const hdr = ['Timestamp','Tipo','Elemento','Acción','Detalle','Estado'];
   sheet.appendRow(hdr);
   sheet.getRange(1,1,1,hdr.length)
     .setFontWeight('bold')
@@ -158,6 +159,7 @@ function prepararIndiceSheet_() {
   if (!sheet) sheet = ss.insertSheet(INDEX_SHEET);
   sheet.clearContents();
   sheet.clearFormats();
+  sheet.clearConditionalFormatRules();
 
   const headers = [
     'Est.',          // A
@@ -260,6 +262,7 @@ function indexarDrive(skipAlert) {
   if (indexRows.length) {
     indexSheet.getRange(2,1,indexRows.length,indexRows[0].length).setValues(indexRows);
     aplicarFormulasIndiceV8_(indexSheet);
+    aplicarFormatoCondicionalIndiceV8_(indexSheet);
   }
   if (treeRows.length) {
     treeSheet.getRange(2,1,treeRows.length,treeRows[0].length).setValues(treeRows);
@@ -382,6 +385,57 @@ function aplicarFormatoCondicionalArbolV8_(sheet) {
       .whenFormulaSatisfied('=$L2=1')
       .setBackground('#388E3C').setFontColor('#FFFFFF')
       .setRanges([range]).build()
+  );
+
+  sheet.setConditionalFormatRules(rules);
+}
+
+/* Índice — formato condicional por Lvl (P) */
+function aplicarFormatoCondicionalIndiceV8_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const range = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn());
+  const rules = [];
+
+  // Lvl 0 (raíz) → azul oscuro
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=$P2=0')
+      .setBackground('#0D47A1')
+      .setFontColor('#FFFFFF')
+      .setRanges([range])
+      .build()
+  );
+
+  // Lvl 1 → azul medio
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=$P2=1')
+      .setBackground('#1976D2')
+      .setFontColor('#FFFFFF')
+      .setRanges([range])
+      .build()
+  );
+
+  // Lvl 2 → azul claro
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=$P2=2')
+      .setBackground('#BBDEFB')
+      .setFontColor('#0D47A1')
+      .setRanges([range])
+      .build()
+  );
+
+  // Lvl >= 3 → gris suave
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=$P2>=3')
+      .setBackground('#EEEEEE')
+      .setFontColor('#424242')
+      .setRanges([range])
+      .build()
   );
 
   sheet.setConditionalFormatRules(rules);
@@ -609,9 +663,9 @@ function previewOrganizacion() {
 
   const mapaCarpetas = {};
   for (let i = 1; i < data.length; i++) {
-    const ext = data[i][3];
+    const ext    = data[i][3];
     const nombre = data[i][4];
-    const id = data[i][13];
+    const id     = data[i][13];
     if (ext === 'CARPETA' && id && nombre) {
       const pfx = extraerPrefijo_(nombre);
       if (pfx) mapaCarpetas[pfx] = { id, nombre };
@@ -692,8 +746,7 @@ function organizarDesdeIndicePorEstructura() {
         }
       } else {
         const file = DriveApp.getFileById(id);
-        // mover archivo directo
-        file.moveTo(destino);
+        file.moveTo(destino); // mover archivo directo
       }
       sheet.getRange(i+1,18).setValue('✅ Movido → ' + destInfo.nombre).setBackground('#e8f5e9');
       sheet.getRange(i+1,2).clearContent();
