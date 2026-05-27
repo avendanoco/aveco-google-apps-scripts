@@ -4,7 +4,7 @@
  * ============================================================
  * Proyecto   : AVECO Robot Movimientos Bancarios
  * Versión    : 2.1.0
- * Cuenta GWS : antonio.ac@aveco.mx
+ * Cuenta GWS : aveco.bancos@gmail.com
  * Autor      : Antonio Avendaño (antonio.ac@aveco.mx)
  * Repositorio: github.com/avendanoco/aveco-google-apps-scripts
  * Creado     : 2026-05-20
