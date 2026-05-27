@@ -2,7 +2,7 @@
 
 **Versión:** 2.1.0  
 **Autor:** Antonio Avendaño — [antonio.ac@aveco.mx](mailto:antonio.ac@aveco.mx)  
-**Cuenta GWS:** aveco.bancos@aveco.mx  
+**Cuenta GWS:** aveco.bancos@gmail.com
 
 Robot de Google Apps Script que importa, normaliza y deduplica movimientos bancarios de múltiples bancos desde carpetas de Google Drive hacia un Google Sheets de control.
 
