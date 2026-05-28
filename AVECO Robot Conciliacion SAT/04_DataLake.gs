@@ -119,9 +119,9 @@ function getSATCFDIs(params) {
   if (!sheet) return { success: false, error: 'Hoja CFDI_SAT no encontrada' };
 
   let datos = leerHoja_(sheet).filter(r => {
-    const f = (r.fecha_emision || r.fecha || '').toString().substring(0, 10);
+    const f = aFechaISO_(r.fecha_emision || r.fecha);
     const total = parseFloat(r.total || 0);
-    return f >= desde && f <= hasta && total !== 0;
+    return f && f >= desde && f <= hasta && total !== 0;
   });
   if (soloSinMatch) datos = datos.filter(r => !r.board_match_id && !r.conciliado);
 
@@ -155,8 +155,8 @@ function getBancarios(params) {
   }
 
   let datos = leerHoja_(sheet).filter(r => {
-    const f = (r.fecha_movimiento || r.fecha || '').toString().substring(0, 10);
-    if (f < desde || f > hasta) return false;
+    const f = aFechaISO_(r.fecha_movimiento || r.fecha);
+    if (!f || f < desde || f > hasta) return false;
     const bancoVal = r.banco || '';
     const tipoVal  = r.tipo_movimiento || (parseFloat(r.monto || 0) < 0 ? 'EGRESO' : 'INGRESO');
     if (banco && bancoVal.toString().toUpperCase() !== banco.toUpperCase()) return false;
@@ -192,18 +192,18 @@ function getConciliacion(params) {
   const ss = SpreadsheetApp.openById(cfg.SPREADSHEET_ID);
 
   const satData = leerHoja_(ss.getSheetByName(cfg.HOJAS.CFDI_SAT)).filter(r => {
-    const f = (r.fecha_emision || r.fecha || '').toString().substring(0, 10);
-    return f >= desde && f <= hasta && parseFloat(r.total || 0) !== 0;
+    const f = aFechaISO_(r.fecha_emision || r.fecha);
+    return f && f >= desde && f <= hasta && parseFloat(r.total || 0) !== 0;
   });
   const boardData = leerHoja_(ss.getSheetByName(cfg.HOJAS.BOARD_NORMALIZADO)).filter(r => {
-    const f = (r.fecha_movimiento || '').toString().substring(0, 10);
-    return f >= desde && f <= hasta && parseFloat(r.monto || 0) < 0;
+    const f = aFechaISO_(r.fecha_movimiento);
+    return f && f >= desde && f <= hasta && parseFloat(r.monto || 0) < 0;
   });
   let sheetBanc = ss.getSheetByName(cfg.HOJAS.BANCARIOS);
   if (!sheetBanc || sheetBanc.getLastRow() <= 1) sheetBanc = ss.getSheetByName(cfg.HOJAS.BANCARIOS_RAW);
   const bancData = sheetBanc ? leerHoja_(sheetBanc).filter(r => {
-    const f = (r.fecha_movimiento || r.fecha || '').toString().substring(0, 10);
-    return f >= desde && f <= hasta;
+    const f = aFechaISO_(r.fecha_movimiento || r.fecha);
+    return f && f >= desde && f <= hasta;
   }) : [];
 
   const totalSAT   = satData.reduce((s, r)   => s + parseFloat(r.total || 0), 0);
@@ -343,23 +343,24 @@ function normalizarMovimientosBancarios() {
   if (!sheetRaw || sheetRaw.getLastRow() <= 1) return { procesados: 0, insertados: 0, duplicados: 0, error: cfg.HOJAS.BANCARIOS_RAW + ' vacía o no existe' };
   if (!sheetNorm) return { procesados: 0, insertados: 0, duplicados: 0, error: 'Hoja ' + cfg.HOJAS.BANCARIOS + ' no existe (ejecuta Configuración)' };
 
+  const headers = getSchema_().MOVIMIENTOS_BANCARIOS;
   const datosRaw = leerHoja_(sheetRaw);
-  const idxNorm = colIndex_(sheetNorm);
-  const colId = idxNorm['id_interno'] ?? 0;
 
-  const existentes = new Set(
-    sheetNorm.getLastRow() > 1
-      ? sheetNorm.getRange(2, colId + 1, sheetNorm.getLastRow() - 1, 1).getValues().map(r => r[0])
-      : []
-  );
+  // Reconstrucción total: el RAW es la foto completa de las carpetas, así que
+  // limpiamos la hoja, reponemos encabezados y reescribimos. Esto también
+  // repara hojas viejas que quedaron sin fila de encabezados o desalineadas.
+  sheetNorm.clear();
+  sheetNorm.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+  sheetNorm.setFrozenRows(1);
 
+  const existentes = new Set();
   let procesados = 0, insertados = 0, duplicados = 0;
   const newRows = [];
 
   datosRaw.forEach(row => {
     const banco  = row.banco || '';
     const cuenta = row.cuenta_bancaria || row.cuenta || banco; // sin alias, usa banco
-    const fecha  = row.fecha || row.fecha_movimiento || '';
+    const fecha  = aFechaISO_(row.fecha || row.fecha_movimiento); // texto ISO, nunca Date
     const moneda = row.moneda || 'MXN';
     const desc   = row.descripcion || '';
     const ref    = row.referencia || '';
@@ -449,6 +450,7 @@ function normalizarBoard() {
   if (!sheetCsv || sheetCsv.getLastRow() <= 1) return { procesados: 0, insertados: 0, error: cfg.HOJAS.BOARD_CSV_RAW + ' vacía o no existe' };
   if (!sheetNorm) return { procesados: 0, insertados: 0, error: 'Hoja ' + cfg.HOJAS.BOARD_NORMALIZADO + ' no existe (ejecuta Configuración)' };
 
+  const headers = getSchema_().BOARD_NORMALIZADO;
   const filas = leerHoja_(sheetCsv);
   let procesados = 0;
   const newRows = [];
@@ -457,7 +459,7 @@ function normalizarBoard() {
     const account = row.account || '';
     const amount  = parseFloat(String(row.amount || 0).replace(/[$,\s]/g, '')) || 0;
     const tipo    = (row.type || '').toString().toLowerCase();
-    const fecha   = (row.date || '').toString();
+    const fecha   = aFechaISO_(row.date);
     if (!account && !amount) return;
     procesados++;
 
@@ -474,8 +476,11 @@ function normalizarBoard() {
     ]);
   });
 
-  // Reemplazo total del normalizado (el CSV es la fuente íntegra del mes).
-  if (sheetNorm.getLastRow() > 1) sheetNorm.deleteRows(2, sheetNorm.getLastRow() - 1);
+  // Reconstrucción total: el CSV es la foto íntegra. Limpiamos, reponemos
+  // encabezados y reescribimos (repara hojas sin headers o desalineadas).
+  sheetNorm.clear();
+  sheetNorm.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+  sheetNorm.setFrozenRows(1);
   if (newRows.length > 0) sheetNorm.getRange(2, 1, newRows.length, newRows[0].length).setValues(newRows);
 
   const msg = 'Board normalizado desde CSV: ' + newRows.length + ' de ' + procesados + ' filas';
@@ -823,6 +828,33 @@ function hoy_() { return Utilities.formatDate(new Date(), getConfig().TIMEZONE, 
 function getHaceNDias_(n) {
   const d = new Date(); d.setDate(d.getDate() - n);
   return Utilities.formatDate(d, getConfig().TIMEZONE, 'yyyy-MM-dd');
+}
+
+/**
+ * Convierte CUALQUIER valor de fecha a 'YYYY-MM-DD' para comparar de forma
+ * fiable. Maneja: objeto Date real de Sheets, texto ISO ('2026-02-27T...'),
+ * y el texto feo de un Date serializado ('Sat Mar 07 2026 03:00:00 GMT...').
+ * Devuelve '' si no logra interpretar la fecha.
+ *
+ * Este helper existe porque comparar fechas como texto crudo fallaba: un
+ * Date.toString() empieza con 'Sat Mar 07', que nunca cae dentro de un rango
+ * 'YYYY-MM-DD' y dejaba la conciliación en ceros.
+ * @param {Date|string|number} v
+ * @returns {string}
+ */
+function aFechaISO_(v) {
+  if (v === null || v === undefined || v === '') return '';
+  if (v instanceof Date && !isNaN(v.getTime())) {
+    return Utilities.formatDate(v, getConfig().TIMEZONE, 'yyyy-MM-dd');
+  }
+  const s = String(v).trim();
+  // Ya viene como YYYY-MM-DD (con o sin hora): tomar los primeros 10.
+  const iso = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (iso) return iso[1];
+  // Cualquier otro texto (incluido 'Sat Mar 07 2026 ...'): intentar Date().
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return Utilities.formatDate(d, getConfig().TIMEZONE, 'yyyy-MM-dd');
+  return '';
 }
 
 function formatMXN_(monto) {

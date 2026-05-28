@@ -191,7 +191,7 @@ function ejecutarFuzzyConciliacion_(params) {
   cfdis.forEach(cfdi => {
     const nomCfdi  = String(cfdi.nombre_emisor || cfdi.razon_social || '');
     const monCfdi  = Math.abs(parseFloat(cfdi.total || cfdi.monto || 0));
-    const fechCfdi = String(cfdi.fecha || cfdi.fecha_emision || '').substring(0, 10);
+    const fechCfdi = aFechaISO_(cfdi.fecha || cfdi.fecha_emision);
     const uuid     = String(cfdi.uuid || cfdi.id || '');
     if (!monCfdi) return;
 
@@ -200,7 +200,7 @@ function ejecutarFuzzyConciliacion_(params) {
       if (usados.has(i)) return;
       const desc  = String(b.descripcion || b.descripcion_limpia || b.nota || '');
       const monB  = Math.abs(parseFloat(b.monto || 0));
-      const fechB = String(b.fecha || b.fecha_movimiento || '').substring(0, 10);
+      const fechB = aFechaISO_(b.fecha || b.fecha_movimiento);
       const sim   = similitudJaccard_(nomCfdi, desc);
       const okM   = monCfdi > 0 && monB > 0 && Math.abs(monCfdi - monB) / Math.max(monCfdi, monB) <= tolMonto;
       const okF   = Math.abs(diasEntre_(fechCfdi, fechB)) <= 7;
