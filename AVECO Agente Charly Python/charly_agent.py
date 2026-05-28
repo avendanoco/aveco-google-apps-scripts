@@ -15,16 +15,16 @@ Description:
     Notifica via Discord webhooks con embeds estructurados.
     Compatible con n8n via servidor HTTP (Flask).
 Config requerida (.env):
-    ANTHROPIC_API_KEY     → API key de Anthropic
-    DISCORD_WEBHOOK_URL   → Webhook del canal #finanzas en Discord
-    APPS_SCRIPT_URL       → URL del Apps Script Web App (GET-based)
-    PORT                  → Puerto del servidor HTTP (default: 8080)
+    ANTHROPIC_API_KEY     ->API key de Anthropic
+    DISCORD_WEBHOOK_URL   ->Webhook del canal #finanzas en Discord
+    APPS_SCRIPT_URL       ->URL del Apps Script Web App (GET-based)
+    PORT                  ->Puerto del servidor HTTP (default: 8080)
 Seguridad:
     No almacenar secrets en código. Usar variables de entorno (.env).
     El Apps Script URL es público por diseño (GET sin auth).
 Uso:
-    python charly_agent.py            → modo conversacional (terminal)
-    python charly_agent.py --server   → servidor HTTP para n8n
+    python charly_agent.py            ->modo conversacional (terminal)
+    python charly_agent.py --server   ->servidor HTTP para n8n
     python charly_agent.py --briefing → briefing matutino directo
 =============================================================================
 """
@@ -567,7 +567,7 @@ def testConectividad():
 
     print("\n1. Apps Script ping...")
     r = callAppsScript_("ping")
-    print(f"   → {r}")
+    print(f"   ->{r}")
 
     print("\n2. Discord webhook...")
     ok = sendDiscordEmbed_(
@@ -576,11 +576,11 @@ def testConectividad():
         color=DISCORD_COLOR_OK,
         footer_text="Test — no es un reporte real",
     )
-    print(f"   → {'OK' if ok else 'FALLO (verificar DISCORD_WEBHOOK_URL)'}")
+    print(f"   ->{'OK' if ok else 'FALLO (verificar DISCORD_WEBHOOK_URL)'}")
 
     print("\n3. Apps Script status...")
     r2 = callAppsScript_("getStatus")
-    print(f"   → success={r2.get('success')} | error={r2.get('error','ninguno')}")
+    print(f"   ->success={r2.get('success')} | error={r2.get('error','ninguno')}")
     print("=== Fin del test ===")
 
 
