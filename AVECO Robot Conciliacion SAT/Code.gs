@@ -44,9 +44,12 @@ function getConfig() {
   return {
     SPREADSHEET_ID: props.getProperty('SPREADSHEET_ID')
       || '1ZRtRjgKAbeYXywV0cbVf73UzjYNgC-n6gmcOg9j3R8c',
-    DISCORD_WEBHOOK: props.getProperty('DISCORD_WEBHOOK_URL') || '',
-    SAT_FOLDER_ID:   props.getProperty('SAT_FOLDER_ID') || '',
-    EMAIL:           props.getProperty('EMAIL_NOTIFICATION') || '',
+    DISCORD_WEBHOOK:    props.getProperty('DISCORD_WEBHOOK_URL') || '',
+    DISCORD_BOT_TOKEN:  props.getProperty('DISCORD_BOT_TOKEN') || '',
+    DISCORD_CHANNEL_ID: props.getProperty('DISCORD_CHANNEL_ID') || '',
+    ANTHROPIC_API_KEY:  props.getProperty('ANTHROPIC_API_KEY') || '',
+    SAT_FOLDER_ID:      props.getProperty('SAT_FOLDER_ID') || '',
+    EMAIL:              props.getProperty('EMAIL_NOTIFICATION') || '',
     TIMEZONE:        'America/Mexico_City',
     HOJAS: {
       CFDI_SAT_RAW:         'CFDI_SAT_RAW',
