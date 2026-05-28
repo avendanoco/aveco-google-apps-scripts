@@ -3,7 +3,7 @@
  * AVECO Robot Financiero — Importador de Movimientos Bancarios
  * ============================================================
  * Proyecto   : AVECO Robot Financiero
- * Versión    : 3.0.0
+ * Versión    : 3.2.0
  * Cuenta GWS : aveco.bancos@gmail.com
  * Autor      : Antonio Avendaño (antonio.ac@aveco.mx)
  * Repositorio: github.com/avendanoco/aveco-google-apps-scripts
@@ -11,53 +11,203 @@
  * Actualizado: 2026-05-28
  *
  * Descripción:
- *   Robot diario para importación y deduplicación de movimientos
- *   bancarios desde Google Drive hacia MOVIMIENTOS_BANCARIOS_RAW.
- *   Soporta Sheets, CSV, TXT, TSV y XML (parser base por banco).
- *   Notifica resultados y errores a Discord (módulo compartido).
+ *   Robot diario de importación bancaria. Cada banco exporta su CSV con
+ *   una estructura DISTINTA, así que cada uno tiene su PROPIA función
+ *   parser (BANK_PARSERS) que sabe leer su formato y devuelve un registro
+ *   homogéneo. Todos escriben el MISMO esquema en MOVIMIENTOS_BANCARIOS_RAW.
+ *
+ *   El parser se elige por el NOMBRE DE LA SUBCARPETA del banco en Drive
+ *   (debe empezar con la clave del banco: 'TD SANTANDER', 'TD FONDEADORA',
+ *   'TD DOLAR', 'TD BBVA', 'TC KONFIO', 'TC CLARA').
+ *
+ * MONEDA:
+ *   La columna 'monto' es SIEMPRE en MXN (moneda base del DataLake).
+ *   Para la cuenta en dólares, se conserva además 'monto_usd' y 'tipo_cambio'.
  *
  * TRIGGER:
- *   - Time-based diario ~06:00 (America/Mexico_City).
- *   - Función objetivo: runDailySync()
- *   - Instalar: installDailyTrigger()  ·  Remover: removeDailyTrigger()
+ *   runDailySync()  → diario ~06:00 (America/Mexico_City)
+ *   installDailyTrigger() / removeDailyTrigger()
  *
  * CONFIGURACIÓN (Script Properties — ver 00_Config.gs):
- *   SPREADSHEET_ID          → Google Sheet destino
- *   DRIVE_BANCOS_FOLDER_ID  → Carpeta raíz de bancos (subcarpetas por banco)
- *   DISCORD_WEBHOOK_URL     → Webhook de notificaciones
- *
- * HOJAS REQUERIDAS:
- *   MOVIMIENTOS_BANCARIOS_RAW · MOVIMIENTOS_BANCARIOS
+ *   SPREADSHEET_ID · DRIVE_BANCOS_FOLDER_ID · DISCORD_WEBHOOK_URL
  *
  * DEPENDENCIAS INTERNAS:
- *   getConfig() / requireConfig_()   → 00_Config.gs
- *   notifyDiscordSuccess_/Error_     → 01_Notificaciones.gs
- *
- * NOTAS DE SEGURIDAD:
- *   - Sin IDs ni webhooks en el código. Todo en Script Properties.
+ *   getConfig / getSchema_ / requireConfig_ / colIndex_  → 00_Config.gs
+ *   notifyDiscordSuccess_/Error_                         → 01_Notificaciones.gs
+ *   normalizarMovimientosBancarios                       → 04_DataLake.gs
  * ============================================================
  */
 
 
 // ============================================================
-// SECCIÓN 1 — MAPEO DE COLUMNAS POR BANCO
+// SECCIÓN 1 — PARSERS POR BANCO
 // ============================================================
+//
+// Cada parser recibe una fila YA partida en campos (array de strings) y
+// devuelve un objeto homogéneo, o null si la fila debe ignorarse:
+//   { fecha, descripcion, referencia, monto, moneda, monto_usd, tipo_cambio,
+//     contraparte }
+// 'monto' es firmado y en MXN: negativo = egreso, positivo = ingreso.
+//
+// CONVENCIÓN DE SIGNO:
+//   - Cuentas de débito (TD): cargo/egreso negativo, abono/ingreso positivo.
+//   - Tarjetas de crédito (TC): una COMPRA es un gasto → la guardamos negativa;
+//     bonificaciones/pagos (montos negativos en el CSV) → positivos.
 
 /**
- * Mapeo de columnas por banco. Columna -1 = campo no disponible.
- * Es una constante fija del proyecto (no cambia por entorno).
+ * Diccionario de parsers. La clave es el prefijo del nombre de la subcarpeta.
+ * separator: ',' o '\t'. skipHeader: nº de filas de encabezado a saltar.
  */
-const BANK_CONFIG = {
-  'TD FONDEADORA': { columnMap: { fecha: 1, descripcion: 3, cargo: 4, abono: 5, saldo: 6, referencia: 9 } },
-  'TC KONFIO':     { columnMap: { fecha: 0, descripcion: 1, cargo: 3, abono: 4, saldo: 5, referencia: 7 } },
-  'TC CLARA':      { columnMap: { fecha: 0, descripcion: 2, cargo: 3, abono: 5, saldo: -1, referencia: 6 } },
-  'TD SANTANDER':  { columnMap: { fecha: 0, descripcion: 1, cargo: 2, abono: 3, saldo: 4, referencia: 5 } },
-  'TD BBVA':       { columnMap: { fecha: 0, descripcion: 1, cargo: 2, abono: 3, saldo: 4, referencia: -1 }, useTSV: true, dateFormat: 'MM-DD-YYYY' },
-  'TD BASE MXN':   { columnMap: { fecha: 0, descripcion: 1, cargo: 2, abono: 3, saldo: 4, referencia: 5 } },
-  'TD BASE USD':   { columnMap: { fecha: 0, descripcion: 1, cargo: 2, abono: 3, saldo: 4, referencia: 5 } },
-  'TD DOLAR MXN':  { columnMap: { fecha: 0, descripcion: 1, cargo: 2, abono: 3, saldo: 4, referencia: 5 } },
-  'TD DOLAR USD':  { columnMap: { fecha: 0, descripcion: 1, cargo: 2, abono: 3, saldo: 4, referencia: 5 } },
+const BANK_PARSERS = {
+
+  // Santander: coma, 21 columnas. Signo explícito en col 5 (+/-).
+  // Fecha 'DDMMYYYY' (con comillas simples). Monto en col 6. MXN.
+  'TD SANTANDER': {
+    separator: ',', skipHeader: 1,
+    parse: function (c) {
+      if (c.length < 8) return null;
+      const fecha = parseFechaDDMMYYYY_(limpiaComillas_(c[1]));
+      const signo = limpiaComillas_(c[5]).trim();
+      const importe = parseImporte_(c[6]);
+      if (!importe && importe !== 0) return null;
+      const monto = signo === '-' ? -Math.abs(importe) : Math.abs(importe);
+      const desc = limpiaComillas_(c[4]).trim();
+      const concepto = limpiaComillas_(c[9] || '').trim();
+      // contraparte: beneficiario (egreso) u ordenante (ingreso) según signo
+      const contraparte = signo === '-'
+        ? limpiaComillas_(c[12] || '').trim()
+        : limpiaComillas_(c[14] || '').trim();
+      return {
+        fecha, descripcion: (desc + (concepto ? ' | ' + concepto : '')).trim(),
+        referencia: limpiaComillas_(c[8] || '').trim(),
+        monto, moneda: 'MXN', monto_usd: '', tipo_cambio: '',
+        contraparte,
+      };
+    },
+  },
+
+  // Fondeadora: coma, 19 columnas. Cargo col 4 / Abono col 5 (separados).
+  // Fecha YYYY-MM-DD. Beneficiario col 11, concepto col 14. MXN.
+  'TD FONDEADORA': {
+    separator: ',', skipHeader: 1,
+    parse: function (c) {
+      if (c.length < 7) return null;
+      const fecha = (c[1] || '').trim();
+      const cargo = parseImporte_(c[4]);
+      const abono = parseImporte_(c[5]);
+      const monto = (abono || 0) - Math.abs(cargo || 0);
+      return {
+        fecha, descripcion: (c[14] || c[3] || '').trim(),
+        referencia: (c[16] || c[15] || '').trim(),
+        monto, moneda: 'MXN', monto_usd: '', tipo_cambio: '',
+        contraparte: (c[11] || c[10] || '').trim(),
+      };
+    },
+  },
+
+  // Dólar USD (Wise/fintech): coma, 19 columnas. local_amount col 5 (firmado),
+  // local_currency col 6, fx_rate col 7, base_amount col 8 (en USDC).
+  // La moneda local suele ser MXN; conservamos USD aparte.
+  'TD DOLAR': {
+    separator: ',', skipHeader: 1,
+    parse: function (c) {
+      if (c.length < 9) return null;
+      const fecha = parseFechaWise_(limpiaComillas_(c[0]));
+      const localAmount = parseImporte_(c[5]);
+      const localCur = (c[6] || 'MXN').trim().toUpperCase();
+      const fx = parseImporte_(c[7]);
+      const baseAmount = parseImporte_(c[8]); // en USDC ≈ USD
+      // monto base del DataLake = MXN. Si la moneda local es MXN, ese es el monto.
+      // Si la local fuera USD, convertimos a MXN con fx (fx = MXN por USD).
+      let montoMXN, montoUSD;
+      if (localCur === 'MXN') { montoMXN = localAmount; montoUSD = baseAmount; }
+      else                    { montoUSD = localAmount; montoMXN = fx ? localAmount * fx : ''; }
+      const tipo = (c[1] || '').trim();
+      const desc = (c[4] || tipo || '').trim();
+      return {
+        fecha, descripcion: desc,
+        referencia: (c[1] || '').trim(),
+        monto: montoMXN, moneda: 'MXN',
+        monto_usd: montoUSD, tipo_cambio: fx || '',
+        contraparte: (c[3] || '').trim(),
+      };
+    },
+  },
+
+  // BBVA: TAB, 5 columnas. Fecha DD-MM-YYYY col 0, concepto col 1,
+  // cargo col 2 / abono col 3. MXN.
+  'TD BBVA': {
+    separator: '\t', skipHeader: 1,
+    parse: function (c) {
+      if (c.length < 4) return null;
+      const fecha = parseFechaDDMMYYYYGuion_((c[0] || '').trim());
+      const cargo = parseImporte_(c[2]);
+      const abono = parseImporte_(c[3]);
+      const monto = (abono || 0) - Math.abs(cargo || 0);
+      return {
+        fecha, descripcion: (c[1] || '').trim(),
+        referencia: '', monto, moneda: 'MXN', monto_usd: '', tipo_cambio: '',
+        contraparte: '',
+      };
+    },
+  },
+
+  // Konfio (TC): coma, 23 columnas. Fecha YYYY-MM-DD col 0, desc col 1,
+  // Monto($) col 3. Una COMPRA es gasto → negativa; un crédito (monto
+  // negativo en CSV, p.ej. BONIFICACION) → positivo para nosotros.
+  'TC KONFIO': {
+    separator: ',', skipHeader: 1,
+    parse: function (c) {
+      if (c.length < 4) return null;
+      const fecha = (c[0] || '').trim();
+      const bruto = parseImporte_(c[3]);
+      const tipo = (c[8] || '').trim().toUpperCase();
+      // En el CSV: compra = positivo, bonificación/crédito = negativo.
+      // Gasto debe quedar negativo en el DataLake:
+      const monto = -bruto;
+      return {
+        fecha, descripcion: (c[1] || '').trim(),
+        referencia: (c[7] || '').trim(),
+        monto, moneda: 'MXN', monto_usd: '', tipo_cambio: '',
+        contraparte: (c[16] || c[1] || '').trim(),
+      };
+    },
+  },
+
+  // Clara (TC): coma, 25 columnas, todos los campos entre comillas.
+  // Fecha YYYY-MM-DD col 0, comercio col 2, Monto MXN col 5. Compra = gasto.
+  'TC CLARA': {
+    separator: ',', skipHeader: 1,
+    parse: function (c) {
+      if (c.length < 6) return null;
+      const fecha = limpiaComillas_(c[0]).trim();
+      const montoMXN = parseImporte_(c[5]);
+      const comercio = limpiaComillas_(c[2]).trim();
+      const descripcionExtra = limpiaComillas_(c[24] || '').trim();
+      return {
+        fecha,
+        descripcion: (comercio + (descripcionExtra ? ' | ' + descripcionExtra : '')).trim(),
+        referencia: limpiaComillas_(c[12] || '').trim(),
+        monto: -Math.abs(montoMXN), moneda: 'MXN', monto_usd: '', tipo_cambio: '',
+        contraparte: comercio,
+      };
+    },
+  },
 };
+
+/**
+ * Resuelve qué parser usar según el nombre de la subcarpeta.
+ * Coincide por prefijo (la carpeta puede llamarse 'TD SANTANDER MXN', etc.).
+ * @param {string} folderName
+ * @returns {{key:string, parser:Object}|null}
+ */
+function resolverParser_(folderName) {
+  const norm = folderName.toUpperCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  for (const key of Object.keys(BANK_PARSERS)) {
+    if (norm.indexOf(key) === 0) return { key, parser: BANK_PARSERS[key] };
+  }
+  return null;
+}
 
 
 // ============================================================
@@ -65,8 +215,7 @@ const BANK_CONFIG = {
 // ============================================================
 
 /**
- * Función principal diaria: importa movimientos y deduplica.
- * Secuencia: importar → deduplicar → notificar resumen.
+ * Función principal diaria: importa, deduplica y normaliza.
  */
 function runDailySync() {
   const startedAt = new Date();
@@ -80,30 +229,24 @@ function runDailySync() {
     const dedupResult = removeDuplicatesBancarios_();
     if (!dedupResult.success) Logger.log('Advertencia en deduplicación: ' + dedupResult.error);
 
+    // Encadenar normalización RAW → MOVIMIENTOS_BANCARIOS (vive en 04_DataLake.gs)
+    const normResult = normalizarMovimientosBancarios();
+
+    PropertiesService.getScriptProperties().setProperty('LAST_SUCCESSFUL_SYNC', startedAt.toISOString());
     const durationMs = new Date().getTime() - startedAt.getTime();
 
-    PropertiesService.getScriptProperties()
-      .setProperty('LAST_SUCCESSFUL_SYNC', startedAt.toISOString());
-
-    notifyDiscordSuccess_(
-      'Sincronización diaria completada ✅',
-      'Importación y deduplicación finalizadas correctamente.',
-      {
-        movimientosImportados: String(importResult.totalMovimientos || 0),
-        duplicadosEliminados:  String(dedupResult.duplicatesRemoved || 0),
-        duracion:              durationMs + ' ms',
-        fecha:                 Utilities.formatDate(startedAt, cfg.TIMEZONE, 'dd/MM/yyyy HH:mm'),
-      }
-    );
-
+    notifyDiscordSuccess_('Sincronización diaria completada ✅', 'Importación, deduplicación y normalización finalizadas.', {
+      importados:   String(importResult.totalMovimientos || 0),
+      duplicados:   String(dedupResult.duplicatesRemoved || 0),
+      normalizados: String(normResult.insertados || 0),
+      duracion:     durationMs + ' ms',
+      fecha:        Utilities.formatDate(startedAt, cfg.TIMEZONE, 'dd/MM/yyyy HH:mm'),
+    });
     Logger.log('runDailySync completado en ' + durationMs + ' ms');
 
   } catch (error) {
     Logger.log('Error en runDailySync: ' + error.toString());
-    notifyDiscordError_(
-      'ERROR en sincronización diaria 🚨',
-      'Error: ' + error.toString() + '\n\nStack: ' + (error.stack || '')
-    );
+    notifyDiscordError_('ERROR en sincronización diaria 🚨', 'Error: ' + error.toString() + '\n\nStack: ' + (error.stack || ''));
   }
 }
 
@@ -113,53 +256,50 @@ function runDailySync() {
 // ============================================================
 
 /**
- * Importa todos los movimientos bancarios desde las subcarpetas
- * de Drive hacia MOVIMIENTOS_BANCARIOS_RAW.
+ * Importa todos los movimientos bancarios desde las subcarpetas de Drive
+ * hacia MOVIMIENTOS_BANCARIOS_RAW, usando el parser de cada banco.
  * @returns {Object} { success, totalMovimientos, movimientosPorBanco?, error? }
  */
 function importAllBankMovements_() {
   try {
     const cfg = requireConfig_(['SPREADSHEET_ID', 'DRIVE_BANCOS_FOLDER_ID']);
     const ss  = SpreadsheetApp.openById(cfg.SPREADSHEET_ID);
-    const sheetRaw   = ss.getSheetByName(cfg.HOJAS.BANCARIOS_RAW);
-    const sheetClean = ss.getSheetByName(cfg.HOJAS.BANCARIOS);
+    const sheetRaw = ss.getSheetByName(cfg.HOJAS.BANCARIOS_RAW);
+    if (!sheetRaw) throw new Error('Hoja ' + cfg.HOJAS.BANCARIOS_RAW + ' no existe (ejecuta Configuración)');
 
-    if (!sheetRaw || !sheetClean) {
-      throw new Error('Las hojas ' + cfg.HOJAS.BANCARIOS_RAW + ' y ' + cfg.HOJAS.BANCARIOS + ' no existen');
-    }
+    // Limpiar RAW antes de reimportar (es una foto completa de las carpetas).
+    if (sheetRaw.getLastRow() > 1) sheetRaw.deleteRows(2, sheetRaw.getLastRow() - 1);
 
-    // Limpiar hojas antes de reimportar
-    if (sheetRaw.getLastRow()   > 1) sheetRaw.deleteRows(2,   sheetRaw.getLastRow()   - 1);
-    if (sheetClean.getLastRow() > 1) sheetClean.deleteRows(2, sheetClean.getLastRow() - 1);
-
-    // Detectar subcarpetas por banco
+    const schema = getSchema_().MOVIMIENTOS_BANCARIOS_RAW; // orden de columnas destino
     const parentFolder = DriveApp.getFolderById(cfg.DRIVE_BANCOS_FOLDER_ID);
-    const subfolders   = parentFolder.getFolders();
-    const bancoFolders = {};
+    const subfolders = parentFolder.getFolders();
+
+    let totalMovimientos = 0;
+    const movimientosPorBanco = {};
+    const sinParser = [];
+    const allRows = [];
+
     while (subfolders.hasNext()) {
       const folder = subfolders.next();
-      bancoFolders[folder.getName().toUpperCase()] = folder.getId();
-    }
+      const resuelto = resolverParser_(folder.getName());
+      if (!resuelto) { sinParser.push(folder.getName()); continue; }
 
-    let totalMovimientos      = 0;
-    const movimientosPorBanco = {};
-
-    for (const bancoName in bancoFolders) {
-      if (!BANK_CONFIG[bancoName]) {
-        Logger.log('AVISO: ' + bancoName + ' sin configuración en BANK_CONFIG. Se omitirá.');
-        continue;
-      }
-      const movs = processBankFolder_(bancoFolders[bancoName], bancoName);
-      movimientosPorBanco[bancoName] = movs.length;
+      const movs = procesarCarpetaBanco_(folder, resuelto.key, resuelto.parser);
+      movimientosPorBanco[resuelto.key] = (movimientosPorBanco[resuelto.key] || 0) + movs.length;
       totalMovimientos += movs.length;
-      if (movs.length > 0) writeToSheet_(sheetRaw, movs);
+
+      // Convertir cada registro homogéneo al ORDEN del esquema RAW.
+      movs.forEach(m => allRows.push(filaDesdeRegistro_(m, schema)));
     }
 
-    for (const banco in movimientosPorBanco) {
-      Logger.log(banco + ': ' + movimientosPorBanco[banco] + ' movimientos importados');
+    if (allRows.length > 0) {
+      sheetRaw.getRange(2, 1, allRows.length, schema.length).setValues(allRows);
     }
 
-    return { success: true, totalMovimientos, movimientosPorBanco };
+    if (sinParser.length) Logger.log('Carpetas sin parser (omitidas): ' + sinParser.join(', '));
+    for (const b in movimientosPorBanco) Logger.log(b + ': ' + movimientosPorBanco[b] + ' movimientos');
+
+    return { success: true, totalMovimientos, movimientosPorBanco, sinParser };
 
   } catch (error) {
     Logger.log('Error en importAllBankMovements_: ' + error.toString());
@@ -167,54 +307,100 @@ function importAllBankMovements_() {
   }
 }
 
+/**
+ * Procesa todos los archivos CSV/TSV de una carpeta de banco con su parser.
+ * @param {Folder} folder
+ * @param {string} bankKey
+ * @param {Object} parser  Entrada de BANK_PARSERS.
+ * @returns {Array<Object>} Registros homogéneos + campo archivo_origen/banco.
+ */
+function procesarCarpetaBanco_(folder, bankKey, parser) {
+  const files = folder.getFiles();
+  const registros = [];
+
+  while (files.hasNext()) {
+    const file = files.next();
+    const nombre = file.getName();
+    if (!/\.(csv|txt|tsv)$/i.test(nombre) &&
+        file.getMimeType().indexOf('csv') === -1 &&
+        file.getMimeType() !== 'text/plain') {
+      continue;
+    }
+
+    try {
+      const contenido = file.getBlob().getDataAsString('UTF-8');
+      const lineas = contenido.split(/\r?\n/).filter(l => l.trim() !== '');
+      for (let i = parser.skipHeader; i < lineas.length; i++) {
+        const campos = splitLinea_(lineas[i], parser.separator);
+        let reg;
+        try { reg = parser.parse(campos); } catch (e) { reg = null; }
+        if (!reg || !reg.fecha) continue;
+        reg.banco = bankKey;
+        reg.archivo_origen = nombre;
+        registros.push(reg);
+      }
+      Logger.log(bankKey + ' · ' + nombre + ': ' + (lineas.length - parser.skipHeader) + ' filas leídas');
+    } catch (e) {
+      Logger.log('Error leyendo ' + nombre + ': ' + e.toString());
+    }
+  }
+  return registros;
+}
+
+/**
+ * Convierte un registro homogéneo al array ordenado según el esquema RAW.
+ * @param {Object} m
+ * @param {string[]} schema  Nombres de columna en orden.
+ * @returns {Array}
+ */
+function filaDesdeRegistro_(m, schema) {
+  const mapa = {
+    banco: m.banco || '', fecha: m.fecha || '', descripcion: m.descripcion || '',
+    referencia: m.referencia || '', monto: (m.monto === '' ? '' : m.monto),
+    moneda: m.moneda || 'MXN', monto_usd: (m.monto_usd === '' ? '' : m.monto_usd),
+    tipo_cambio: (m.tipo_cambio === '' ? '' : m.tipo_cambio),
+    contraparte: m.contraparte || '', categoria: '', obra: '', link_cfdi: '',
+    archivo_origen: m.archivo_origen || '',
+  };
+  return schema.map(col => (mapa[col] !== undefined ? mapa[col] : ''));
+}
+
 
 // ============================================================
-// SECCIÓN 4 — LÓGICA DE DEDUPLICACIÓN
+// SECCIÓN 4 — DEDUPLICACIÓN
 // ============================================================
 
 /**
- * Detecta y elimina duplicados en MOVIMIENTOS_BANCARIOS.
- * Criterio: Banco | Fecha normalizada | Cargo | Abono | Referencia.
- * Reescribe la hoja en un solo batch (más eficiente que deleteRow en bucle).
- * @returns {Object} { success, duplicatesRemoved, processedRows, durationMs, error? }
+ * Elimina duplicados en MOVIMIENTOS_BANCARIOS_RAW.
+ * Criterio: banco | fecha | monto | descripción. Reescribe en batch.
+ * @returns {Object} { success, duplicatesRemoved, processedRows, error? }
  */
 function removeDuplicatesBancarios_() {
-  const startedAt = new Date();
-
   try {
-    const cfg   = requireConfig_(['SPREADSHEET_ID']);
-    const sheet = SpreadsheetApp.openById(cfg.SPREADSHEET_ID).getSheetByName(cfg.HOJAS.BANCARIOS);
-    if (!sheet) throw new Error('Hoja ' + cfg.HOJAS.BANCARIOS + ' no existe');
+    const cfg = requireConfig_(['SPREADSHEET_ID']);
+    const sheet = SpreadsheetApp.openById(cfg.SPREADSHEET_ID).getSheetByName(cfg.HOJAS.BANCARIOS_RAW);
+    if (!sheet) throw new Error('Hoja ' + cfg.HOJAS.BANCARIOS_RAW + ' no existe');
 
     const lastRow = sheet.getLastRow();
     const lastCol = sheet.getLastColumn();
-    if (lastRow <= 1) {
-      return { success: true, duplicatesRemoved: 0, message: 'No hay datos para procesar' };
-    }
+    if (lastRow <= 1) return { success: true, duplicatesRemoved: 0, message: 'Sin datos' };
 
-    const data    = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
-    const seen     = new Set();
-    const unicos   = [];
-    let duplicados = 0;
+    const idx = colIndex_(sheet);
+    const cB = idx['banco'] ?? 0, cF = idx['fecha'] ?? 1, cM = idx['monto'] ?? 4, cD = idx['descripcion'] ?? 2;
 
+    const data = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+    const seen = new Set(); const unicos = []; let dup = 0;
     data.forEach(row => {
-      const key = [row[0], normalizeDateForKey_(row[1]), row[4], row[5], row[3]].join('|');
-      if (seen.has(key)) { duplicados++; return; }
-      seen.add(key);
-      unicos.push(row);
+      const key = [row[cB], row[cF], row[cM], row[cD]].join('|');
+      if (seen.has(key)) { dup++; return; }
+      seen.add(key); unicos.push(row);
     });
 
-    if (duplicados > 0) {
+    if (dup > 0) {
       sheet.getRange(2, 1, data.length, lastCol).clearContent();
       if (unicos.length) sheet.getRange(2, 1, unicos.length, lastCol).setValues(unicos);
     }
-
-    return {
-      success:           true,
-      duplicatesRemoved: duplicados,
-      processedRows:     data.length,
-      durationMs:        new Date().getTime() - startedAt.getTime(),
-    };
+    return { success: true, duplicatesRemoved: dup, processedRows: data.length };
 
   } catch (error) {
     Logger.log('Error en removeDuplicatesBancarios_: ' + error.toString());
@@ -224,180 +410,64 @@ function removeDuplicatesBancarios_() {
 
 
 // ============================================================
-// SECCIÓN 5 — UTILIDADES PRIVADAS
+// SECCIÓN 5 — UTILIDADES DE PARSEO
 // ============================================================
 
 /**
- * Procesa los archivos de una carpeta de banco.
- * @param {string} folderId
- * @param {string} bancoName
- * @returns {Array<Array>}
- */
-function processBankFolder_(folderId, bancoName) {
-  const folder      = DriveApp.getFolderById(folderId);
-  const files       = folder.getFiles();
-  const movimientos = [];
-  const configBanco = BANK_CONFIG[bancoName];
-
-  while (files.hasNext()) {
-    const file = files.next();
-    try {
-      const fileData = readFileUniversal_(file, bancoName);
-      if (!fileData || fileData.length <= 1) {
-        Logger.log('Archivo vacío o sin datos: ' + file.getName());
-        continue;
-      }
-
-      for (let i = 1; i < fileData.length; i++) {
-        const row = fileData[i];
-        if (!row || !row[0]) continue;
-
-        const fechaRaw = row[configBanco.columnMap.fecha] || '';
-        let fechaFinal = fechaRaw;
-
-        // Normalización de fecha MM-DD-YYYY → DD-MM-YYYY (específico BBVA)
-        if (configBanco.dateFormat === 'MM-DD-YYYY' && fechaRaw) {
-          const partes = String(fechaRaw).split('-');
-          if (partes.length === 3) fechaFinal = partes[1] + '-' + partes[0] + '-' + partes[2];
-        }
-
-        const descripcion = row[configBanco.columnMap.descripcion] || '';
-        const cargo       = row[configBanco.columnMap.cargo] || '0';
-        const abono       = row[configBanco.columnMap.abono] || '0';
-        const saldo       = configBanco.columnMap.saldo      >= 0 ? (row[configBanco.columnMap.saldo]      || '0') : '0';
-        const referencia  = configBanco.columnMap.referencia >= 0 ? (row[configBanco.columnMap.referencia] || '')  : '';
-
-        movimientos.push([
-          bancoName, fechaFinal, descripcion, referencia,
-          cargo, abono, saldo,
-          '', '', '',
-          file.getName(),
-        ]);
-      }
-
-      Logger.log('Procesados ' + (fileData.length - 1) + ' registros de ' + file.getName());
-
-    } catch (e) {
-      Logger.log('Error procesando ' + file.getName() + ': ' + e.toString());
-    }
-  }
-
-  return movimientos;
-}
-
-/**
- * Lee un archivo de forma universal: Sheets, CSV, TXT, TSV o XML.
- * @param {File} file
- * @param {string} bancoName
- * @returns {Array<Array>}
- */
-function readFileUniversal_(file, bancoName) {
-  const mimeType = file.getMimeType();
-  const fileName = file.getName().toLowerCase();
-
-  try {
-    if (mimeType === 'application/vnd.google-apps.spreadsheet') {
-      return SpreadsheetApp.openById(file.getId()).getSheets()[0].getDataRange().getValues();
-    }
-
-    if (mimeType === 'text/csv' || mimeType === 'text/plain' ||
-        fileName.endsWith('.csv') || fileName.endsWith('.txt')) {
-      const content = file.getBlob().getDataAsString('UTF-8');
-      const useTSV  = BANK_CONFIG[bancoName] && BANK_CONFIG[bancoName].useTSV;
-      return content.split('\n')
-        .filter(line => line.trim() !== '')
-        .map(line => useTSV ? line.split('\t') : parseCSVLine_(line));
-    }
-
-    if (mimeType === 'text/xml' || mimeType === 'application/xml' || fileName.endsWith('.xml')) {
-      return parseXMLToArray_(file.getBlob().getDataAsString('UTF-8'));
-    }
-
-    Logger.log('Tipo MIME no soportado: ' + mimeType + ' → ' + file.getName());
-    return [];
-
-  } catch (e) {
-    Logger.log('Error leyendo ' + file.getName() + ': ' + e.toString());
-    return [];
-  }
-}
-
-/**
- * Parser XML base. Implementación específica por banco pendiente.
- * @param {string} xmlContent
- * @returns {Array<Array>}
- */
-function parseXMLToArray_(xmlContent) {
-  try {
-    XmlService.parse(xmlContent);
-    Logger.log('Parser XML: implementación específica pendiente por banco.');
-  } catch (e) {
-    Logger.log('Error parseando XML: ' + e.toString());
-  }
-  return [];
-}
-
-/**
- * Escribe movimientos en la hoja destino en un solo batch.
- * @param {Sheet} sheet
- * @param {Array<Array>} movimientos
- */
-function writeToSheet_(sheet, movimientos) {
-  if (!movimientos || movimientos.length === 0) return;
-  sheet.getRange(sheet.getLastRow() + 1, 1, movimientos.length, 11).setValues(movimientos);
-}
-
-/**
- * Parser CSV con soporte para comillas y comas dentro de campos.
+ * Parser de línea CSV/TSV con soporte de comillas dobles y separador embebido.
  * @param {string} line
- * @returns {Array<string>}
+ * @param {string} sep  ',' o '\t'
+ * @returns {string[]}
  */
-function parseCSVLine_(line) {
-  const fields = [];
-  let current  = '';
-  let inQuotes = false;
-
+function splitLinea_(line, sep) {
+  if (sep === '\t') return line.split('\t');
+  const out = [];
+  let cur = '', q = false;
   for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    if (char === '"') {
-      inQuotes = !inQuotes;
-    } else if (char === ',' && !inQuotes) {
-      fields.push(current.trim());
-      current = '';
-    } else {
-      current += char;
-    }
+    const ch = line[i];
+    if (ch === '"') {
+      if (q && line[i + 1] === '"') { cur += '"'; i++; }
+      else q = !q;
+    } else if (ch === sep && !q) { out.push(cur); cur = ''; }
+    else cur += ch;
   }
-
-  fields.push(current.trim());
-  return fields;
+  out.push(cur);
+  return out;
 }
 
-/**
- * Normaliza fecha a yyyy-MM-dd para claves de deduplicación.
- * @param {Date|string} date
- * @returns {string}
- */
-function normalizeDateForKey_(date) {
-  if (!date) return '';
-  if (date instanceof Date) {
-    return Utilities.formatDate(date, getConfig().TIMEZONE, 'yyyy-MM-dd');
-  }
+/** Quita comillas simples envolventes tipo Santander ('texto '). */
+function limpiaComillas_(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/^['"]+|['"]+$/g, '');
+}
 
-  const dateStr = date.toString().trim();
-  const formats = [
-    /^(\d{4})-(\d{2})-(\d{2})$/,
-    /^(\d{2})\/(\d{2})\/(\d{4})$/,
-    /^(\d{2})-(\d{2})-(\d{4})$/,
-  ];
+/** Convierte importe textual ("1,234.56", "-50000.00", "57") a número. */
+function parseImporte_(s) {
+  if (s === null || s === undefined || s === '') return 0;
+  const n = parseFloat(String(s).replace(/[$,\s]/g, ''));
+  return isNaN(n) ? 0 : n;
+}
 
-  for (const fmt of formats) {
-    const match = dateStr.match(fmt);
-    if (match) {
-      return match[1].length === 4 ? dateStr : match[3] + '-' + match[2] + '-' + match[1];
-    }
-  }
-  return dateStr;
+/** 'DDMMYYYY' (Santander, con o sin comillas) → 'YYYY-MM-DD'. */
+function parseFechaDDMMYYYY_(s) {
+  const t = String(s).replace(/\D/g, '');
+  if (t.length !== 8) return String(s);
+  return t.substring(4, 8) + '-' + t.substring(2, 4) + '-' + t.substring(0, 2);
+}
+
+/** 'DD-MM-YYYY' (BBVA) → 'YYYY-MM-DD'. */
+function parseFechaDDMMYYYYGuion_(s) {
+  const m = String(s).match(/(\d{2})-(\d{2})-(\d{4})/);
+  return m ? m[3] + '-' + m[2] + '-' + m[1] : String(s);
+}
+
+/** 'Dec 13, 2025, 03:59 PM' (Wise) → 'YYYY-MM-DD'. */
+function parseFechaWise_(s) {
+  const meses = { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' };
+  const m = String(s).match(/([A-Za-z]{3})\s+(\d{1,2}),\s*(\d{4})/);
+  if (!m) return String(s);
+  const mes = meses[m[1].toLowerCase()] || '01';
+  return m[3] + '-' + mes + '-' + m[2].padStart(2, '0');
 }
 
 
@@ -405,33 +475,17 @@ function normalizeDateForKey_(date) {
 // SECCIÓN 6 — GESTIÓN DEL TRIGGER
 // ============================================================
 
-/**
- * Instala el trigger diario para runDailySync() a las 06:00 (México).
- * Ejecutar UNA VEZ manualmente desde el editor.
- */
 function installDailyTrigger() {
   removeDailyTrigger();
-  ScriptApp.newTrigger('runDailySync')
-    .timeBased()
-    .atHour(6)
-    .everyDays(1)
-    .inTimezone('America/Mexico_City')
-    .create();
+  ScriptApp.newTrigger('runDailySync').timeBased().atHour(6).everyDays(1).inTimezone('America/Mexico_City').create();
   Logger.log('Trigger diario instalado: runDailySync() → 06:00 America/Mexico_City');
 }
 
-/**
- * Elimina todos los triggers que apuntan a runDailySync().
- */
 function removeDailyTrigger() {
-  const triggers = ScriptApp.getProjectTriggers();
   let removed = 0;
-  for (const trigger of triggers) {
-    if (trigger.getHandlerFunction() === 'runDailySync') {
-      ScriptApp.deleteTrigger(trigger);
-      removed++;
-    }
-  }
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'runDailySync') { ScriptApp.deleteTrigger(t); removed++; }
+  });
   Logger.log('Triggers runDailySync eliminados: ' + removed);
 }
 
@@ -440,25 +494,27 @@ function removeDailyTrigger() {
 // SECCIÓN 7 — FUNCIONES DE PRUEBA MANUAL
 // ============================================================
 
-/** Ejecuta el ciclo completo igual que el trigger. */
-function testRunDailySync() {
-  runDailySync();
-}
+/** Ejecuta el ciclo diario completo. */
+function testRunDailySync() { runDailySync(); }
 
-/** Prueba solo la importación. */
+/** Importa sin normalizar (revisar RAW). */
 function testImportBankMovements() {
-  Logger.log('Resultado importación: ' + JSON.stringify(importAllBankMovements_()));
+  Logger.log(JSON.stringify(importAllBankMovements_(), null, 2));
 }
 
-/** Prueba solo la deduplicación. */
-function testDetectAndRemoveDuplicates() {
-  Logger.log('Resultado deduplicación: ' + JSON.stringify(removeDuplicatesBancarios_()));
+/** Lista qué subcarpetas hay y qué parser les tocaría (no importa nada). */
+function testDetectarBancos() {
+  const cfg = requireConfig_(['DRIVE_BANCOS_FOLDER_ID']);
+  const subs = DriveApp.getFolderById(cfg.DRIVE_BANCOS_FOLDER_ID).getFolders();
+  while (subs.hasNext()) {
+    const f = subs.next();
+    const r = resolverParser_(f.getName());
+    Logger.log(f.getName() + ' → ' + (r ? r.key : 'SIN PARSER'));
+  }
 }
 
-/** Verifica que el trigger esté correctamente instalado. */
+/** Verifica el estado del trigger diario. */
 function testCheckTriggerStatus() {
   const daily = ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'runDailySync');
-  Logger.log(daily.length === 0
-    ? 'No hay trigger instalado para runDailySync. Ejecutar installDailyTrigger().'
-    : 'Trigger activo: ' + daily.length + ' instancia(s) de runDailySync');
+  Logger.log(daily.length ? 'Trigger activo: ' + daily.length : 'Sin trigger. Ejecuta installDailyTrigger().');
 }
