@@ -360,7 +360,8 @@ function normalizarMovimientosBancarios() {
   datosRaw.forEach(row => {
     const banco  = row.banco || '';
     const cuenta = row.cuenta_bancaria || row.cuenta || banco; // sin alias, usa banco
-    const fecha  = aFechaISO_(row.fecha || row.fecha_movimiento); // texto ISO, nunca Date
+    const fecha  = aFechaISO_(row.fecha || row.fecha_movimiento);  // texto ISO → id/lógica
+    const fechaVal = aFechaValor_(fecha);                          // Date real → celda
     const moneda = row.moneda || 'MXN';
     const desc   = row.descripcion || '';
     const ref    = row.referencia || '';
@@ -382,7 +383,7 @@ function normalizarMovimientosBancarios() {
     // descripcion_original, descripcion_limpia, contraparte, referencia,
     // folio_banco, categoria, obra, link_cfdi, estado_revision
     newRows.push([
-      idInterno, banco, cuenta, fecha, monto, moneda, montoUsd, tipoCambio, tipo,
+      idInterno, banco, cuenta, fechaVal, monto, moneda, montoUsd, tipoCambio, tipo,
       desc, limpiarDescripcion_(desc), contraparte, ref, '',
       row.categoria || '', row.obra || '', row.link_cfdi || '', 'Pendiente',
     ]);
@@ -459,7 +460,7 @@ function normalizarBoard() {
     const account = row.account || '';
     const amount  = parseFloat(String(row.amount || 0).replace(/[$,\s]/g, '')) || 0;
     const tipo    = (row.type || '').toString().toLowerCase();
-    const fecha   = aFechaISO_(row.date);
+    const fecha   = aFechaValor_(row.date); // Date real para la celda
     if (!account && !amount) return;
     procesados++;
 
@@ -518,9 +519,9 @@ function importSATFromFolder() {
       if (!line) continue;
       const f = line.split('~');
       if (f.length < 11) continue;
-      const monto = parseFloat((f[8] || '').replace(/,/g, ''));
+      const monto = parseFloat((f[8] || '').replace(/,/g, '')) || 0;
       const subtotal = monto / 1.16;
-      rawRows.push([f[0], f[1], f[2], normalizeDate_(f[6]), subtotal.toFixed(2), (monto - subtotal).toFixed(2), monto.toFixed(2), 'MXN', '', f[9] || 'I', f[10]]);
+      rawRows.push([f[0], f[1], f[2], aFechaValor_(f[6]), round2_(subtotal), round2_(monto - subtotal), round2_(monto), 'MXN', '', f[9] || 'I', f[10]]);
     }
     filesProcessed++;
   }
@@ -690,6 +691,10 @@ function onOpen() {
       .addItem('Exportar a Board (Estandares_Board)', 'menuExportarBoard'))
     .addSeparator()
     .addItem('⚙️ Configuración (crear/reparar hojas)', 'menuConfigurar')
+    .addSubMenu(ui.createMenu('🏗️ Reconstrucción')
+      .addItem('Configurar desde cero (formato + fechas)', 'menuConfigurarDesdeCero')
+      .addItem('Convertir en Tablas nativas', 'menuConvertirTablasNativas')
+      .addItem('Purgar pestañas fuera de esquema', 'menuPurgarPestanas'))
     .addToUi();
 }
 
@@ -859,6 +864,27 @@ function aFechaISO_(v) {
 
 function formatMXN_(monto) {
   return new Intl.NumberFormat('es-MX', { style: 'currency', currency: 'MXN' }).format(monto || 0);
+}
+
+/**
+ * Devuelve un objeto Date REAL (hora local, sin corrimiento de zona) para
+ * ESCRIBIR en celdas de fecha, o '' si no se puede interpretar. Reutiliza
+ * aFechaISO_ para parsear; este es para el VALOR de la celda, aFechaISO_ es
+ * para la LÓGICA (comparaciones, ids), que siguen trabajando con texto.
+ * @param {Date|string|number} v
+ * @returns {Date|string}
+ */
+function aFechaValor_(v) {
+  const iso = aFechaISO_(v);           // '' o 'YYYY-MM-DD'
+  if (!iso) return '';
+  const p = iso.split('-');
+  return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+}
+
+/** Redondea a 2 decimales devolviendo NÚMERO (no string como toFixed). */
+function round2_(n) {
+  const x = parseFloat(n);
+  return isNaN(x) ? 0 : Math.round(x * 100) / 100;
 }
 
 function normalizeDate_(dateStr) {
